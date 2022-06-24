@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use escape_string::escape;
 use futures::future;
 use sonnerie::row_format::{parse_row_format, RowFormat};
 use sonnerie::{CreateTx, WriteFailure};
@@ -98,7 +99,7 @@ fn prepare_and_write_messages(
     for mut message in messages.drain(..) {
         let mut text = mem::take(&mut message.sender_login);
         text.push(' ');
-        text.push_str(&mut message.message_text.replace(' ', "\\ "));
+        text.push_str(&escape(&message.message_text));
 
         protocol_buffer.clear();
         let ts = message.server_timestamp.timestamp_nanos() as u64;
