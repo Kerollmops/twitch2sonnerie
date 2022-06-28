@@ -21,6 +21,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "antidote"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34fde25430d87a9388dadbe6e34d7f72a462c8b43ac8d309b42b0a8505d7e2a5"
+
+[[package]]
 name = "anyhow"
 version = "1.0.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1079,10 +1085,11 @@ dependencies = [
 
 [[package]]
 name = "sonnerie"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9264204a2f9171d3af0708e85f8d28114c2960769b824ca9fa2fa68eb4f77cd"
+checksum = "03ec9d5da84f1cfb5b41364296a842630d98ab6313c40a62c8be5eba792b69f3"
 dependencies = [
+ "antidote",
  "byteorder",
  "chrono",
  "clap 2.34.0",
@@ -1097,7 +1104,6 @@ dependencies = [
  "lz4",
  "memchr",
  "memmap",
- "parking_lot 0.12.1",
  "rayon",
  "regex",
  "serde",
