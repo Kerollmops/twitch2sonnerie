@@ -6,7 +6,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use escape_string::escape;
-use futures::future;
+use rustmann::{EventBuilder, RiemannClient, RiemannClientOptionsBuilder};
 use sonnerie::row_format::{parse_row_format, RowFormat};
 use sonnerie::{CreateTx, WriteFailure};
 use tokio::sync::mpsc;
@@ -26,13 +26,33 @@ struct Opts {
     #[clap(long, default_value = "30")]
     commit_timeout_secs: u64,
 
+    #[clap(long, default_value = "twitch2sonnerie")]
+    riemann_service_name: String,
+    #[clap(long, default_value = "localhost")]
+    riemann_host: String,
+    #[clap(long, default_value = "5555")]
+    riemann_port: u16,
+
     /// The list of channels to stream.
     channels: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let Opts { channels, db_path, commit_timeout_secs } = Opts::parse();
+    let Opts {
+        channels,
+        db_path,
+        commit_timeout_secs,
+        riemann_service_name,
+        riemann_host,
+        riemann_port,
+    } = Opts::parse();
+
+    // create the configuration for the riemann monitoring
+    let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
+    let riemann_client = RiemannClient::new(
+        &RiemannClientOptionsBuilder::default().host(riemann_host).port(riemann_port).build(),
+    );
 
     // default configuration is to join chat as anonymous.
     let config = ClientConfig::default();
@@ -52,6 +72,15 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // A tokio tasks that send the events to riemann.
+    let monitoring_handle = tokio::spawn(async move {
+        while let Some(event) = event_receiver.recv().await {
+            if let Err(err) = riemann_client.send_events(vec![event]).await {
+                eprintln!("While sending the event to Riemann: {}", err);
+            }
+        }
+    });
+
     // join a channels
     for channel in channels {
         client.join(channel)?;
@@ -67,7 +96,24 @@ async fn main() -> anyhow::Result<()> {
             let now = Instant::now();
             if now.duration_since(previous_commit_time).as_secs() > commit_timeout_secs {
                 previous_commit_time = now;
+                let number_of_messages = messages.len();
                 messages = prepare_and_write_messages(&db_path, messages, &format, &mut buffer)?;
+
+                let event = EventBuilder::new()
+                    .service(&riemann_service_name)
+                    .host(gethostname::gethostname().to_string_lossy())
+                    .state("ok")
+                    .description(format!(
+                        "{} messages were appended into the sonnerie database",
+                        number_of_messages
+                    ))
+                    .metric_sint64(number_of_messages as i64)
+                    .ttl(commit_timeout_secs as f32 * 2.0)
+                    .build();
+
+                if let Err(err) = event_sender.send(event) {
+                    eprintln!("Error while sending an event in the monitoring channel: {}", err);
+                }
             }
             messages.push(message);
         }
@@ -77,10 +123,12 @@ async fn main() -> anyhow::Result<()> {
 
     // keep the tokio executor alive.
     // If you return instead of waiting the background task will exit.
-    let (fetch_result, write_result) = future::join(fetch_handle, write_handle).await;
+    let (fetch_result, write_result, monitoring_result) =
+        futures::join!(fetch_handle, write_handle, monitoring_handle);
 
     fetch_result?;
     write_result?.unwrap();
+    monitoring_result?;
 
     Ok(())
 }
