@@ -1,11 +1,12 @@
 use std::cmp::Ordering;
-use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use std::{fmt, mem};
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use escape_string::escape;
+use rustmann::protos::riemann::Event;
 use rustmann::{EventBuilder, RiemannClient, RiemannClientOptionsBuilder};
 use sonnerie::row_format::{parse_row_format, RowFormat};
 use sonnerie::{CreateTx, WriteFailure};
@@ -55,10 +56,9 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // default configuration is to join chat as anonymous.
-    let config = ClientConfig::default();
     let (mut incoming_messages, client) =
-        TwitchIRCClient::<SecureTCPTransport, StaticLoginCredentials>::new(config);
-    let (messages_sender, mut messages_receiver) = mpsc::channel(2000);
+        TwitchIRCClient::<SecureTCPTransport, StaticLoginCredentials>::new(ClientConfig::default());
+    let (messages_sender, messages_receiver) = mpsc::channel(2000);
 
     // first thing you should do: start consuming incoming messages,
     // otherwise they will back up.
@@ -87,38 +87,24 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let write_handle = tokio::task::spawn_blocking(move || {
-        let format = parse_row_format("ss");
-        let mut previous_commit_time = Instant::now();
-        let mut messages = Vec::new();
-        let mut buffer = Vec::new();
+        if let Err(e) = write_incoming_messages(
+            messages_receiver,
+            commit_timeout_secs,
+            db_path,
+            &riemann_service_name,
+            event_sender.clone(),
+        ) {
+            let event = EventBuilder::new()
+                .service(&riemann_service_name)
+                .host(gethostname::gethostname().to_string_lossy())
+                .state("error")
+                .description(WriteFailureDisplay(e).to_string())
+                .build();
 
-        while let Some(message) = messages_receiver.blocking_recv() {
-            let now = Instant::now();
-            if now.duration_since(previous_commit_time).as_secs() > commit_timeout_secs {
-                previous_commit_time = now;
-                let number_of_messages = messages.len();
-                messages = prepare_and_write_messages(&db_path, messages, &format, &mut buffer)?;
-
-                let event = EventBuilder::new()
-                    .service(&riemann_service_name)
-                    .host(gethostname::gethostname().to_string_lossy())
-                    .state("ok")
-                    .description(format!(
-                        "{} messages were appended into the sonnerie database",
-                        number_of_messages
-                    ))
-                    .metric_sint64(number_of_messages as i64)
-                    .ttl(commit_timeout_secs as f32 * 2.0)
-                    .build();
-
-                if let Err(err) = event_sender.send(event) {
-                    eprintln!("Error while sending an event in the monitoring channel: {}", err);
-                }
+            if let Err(err) = event_sender.send(event) {
+                eprintln!("Error while sending an event in the monitoring channel: {}", err);
             }
-            messages.push(message);
         }
-
-        prepare_and_write_messages(&db_path, messages, &format, &mut buffer).map(drop)
     });
 
     // keep the tokio executor alive.
@@ -127,10 +113,51 @@ async fn main() -> anyhow::Result<()> {
         futures::join!(fetch_handle, write_handle, monitoring_handle);
 
     fetch_result?;
-    write_result?.unwrap();
+    write_result?;
     monitoring_result?;
 
     Ok(())
+}
+
+fn write_incoming_messages(
+    mut messages_receiver: mpsc::Receiver<TimedUserMessage>,
+    commit_timeout_secs: u64,
+    db_path: PathBuf,
+    riemann_service_name: &str,
+    event_sender: mpsc::UnboundedSender<Event>,
+) -> Result<(), WriteFailure> {
+    let format = parse_row_format("ss");
+    let mut previous_commit_time = Instant::now();
+    let mut messages = Vec::new();
+    let mut buffer = Vec::new();
+
+    while let Some(message) = messages_receiver.blocking_recv() {
+        let now = Instant::now();
+        if now.duration_since(previous_commit_time).as_secs() > commit_timeout_secs {
+            previous_commit_time = now;
+            let number_of_messages = messages.len();
+            messages = prepare_and_write_messages(&db_path, messages, &format, &mut buffer)?;
+
+            let event = EventBuilder::new()
+                .service(riemann_service_name)
+                .host(gethostname::gethostname().to_string_lossy())
+                .state("ok")
+                .description(format!(
+                    "{} messages were appended into the sonnerie database",
+                    number_of_messages
+                ))
+                .metric_sint64(number_of_messages as i64)
+                .ttl(commit_timeout_secs as f32 * 2.0)
+                .build();
+
+            if let Err(err) = event_sender.send(event) {
+                eprintln!("Error while sending an event in the monitoring channel: {}", err);
+            }
+        }
+        messages.push(message);
+    }
+
+    prepare_and_write_messages(&db_path, messages, &format, &mut buffer).map(drop)
 }
 
 fn prepare_and_write_messages(
@@ -191,5 +218,24 @@ impl Ord for TimedUserMessage {
         self.channel_login
             .cmp(&other.channel_login)
             .then_with(|| self.server_timestamp.cmp(&other.server_timestamp))
+    }
+}
+
+struct WriteFailureDisplay(WriteFailure);
+
+impl fmt::Display for WriteFailureDisplay {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match &self.0 {
+            WriteFailure::OrderingViolation(first, second) => {
+                write!(
+                    f,
+                    "The key `{:?}` does not come lexicographically after `{:?}`, \
+                    but they were added in that order",
+                    second, first
+                )
+            }
+            WriteFailure::IncorrectLength(_len) => f.write_str("The size of data was not expected"),
+            WriteFailure::IOError(e) => write!(f, "{}", e),
+        }
     }
 }
