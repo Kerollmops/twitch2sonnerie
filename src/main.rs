@@ -1,14 +1,12 @@
 use std::cmp::Ordering;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use std::{fmt, mem};
 
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use escape_string::escape;
 use rustmann::protos::riemann::Event;
 use rustmann::{EventBuilder, RiemannClient, RiemannClientOptionsBuilder};
-use sonnerie::row_format::{parse_row_format, RowFormat};
 use sonnerie::{CreateTx, WriteFailure};
 use tokio::sync::mpsc;
 use twitch_irc::login::StaticLoginCredentials;
@@ -64,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
     // otherwise they will back up.
     let fetch_handle = tokio::spawn(async move {
         while let Some(message) = incoming_messages.recv().await {
-            if let Ok(message) = TimedUserMessage::from_private_nessage(message) {
+            if let Ok(message) = TimedUserMessage::from_private_message(message) {
                 if messages_sender.send(message).await.is_err() {
                     break;
                 }
@@ -126,17 +124,15 @@ fn write_incoming_messages(
     riemann_service_name: &str,
     event_sender: mpsc::UnboundedSender<Event>,
 ) -> Result<(), WriteFailure> {
-    let format = parse_row_format("ss");
     let mut previous_commit_time = Instant::now();
     let mut messages = Vec::new();
-    let mut buffer = Vec::new();
 
     while let Some(message) = messages_receiver.blocking_recv() {
         let now = Instant::now();
         if now.duration_since(previous_commit_time).as_secs() > commit_timeout_secs {
             previous_commit_time = now;
             let number_of_messages = messages.len();
-            messages = prepare_and_write_messages(&db_path, messages, &format, &mut buffer)?;
+            messages = prepare_and_write_messages(&db_path, messages)?;
 
             let event = EventBuilder::new()
                 .service(riemann_service_name)
@@ -157,29 +153,24 @@ fn write_incoming_messages(
         messages.push(message);
     }
 
-    prepare_and_write_messages(&db_path, messages, &format, &mut buffer).map(drop)
+    prepare_and_write_messages(&db_path, messages).map(drop)
 }
 
 fn prepare_and_write_messages(
     path: &Path,
     mut messages: Vec<TimedUserMessage>,
-    row_format: &Box<dyn RowFormat>,
-    protocol_buffer: &mut Vec<u8>,
 ) -> Result<Vec<TimedUserMessage>, WriteFailure> {
     let mut txn = CreateTx::new(path)?;
 
     messages.sort_unstable();
     messages.dedup_by_key(|msg| msg.server_timestamp);
 
-    for mut message in messages.drain(..) {
-        let mut text = mem::take(&mut message.sender_login);
-        text.push(' ');
-        text.push_str(&escape(&message.message_text));
-
-        protocol_buffer.clear();
-        let ts = message.server_timestamp.timestamp_nanos() as u64;
-        row_format.to_stored_format(ts, &text, protocol_buffer).unwrap();
-        txn.add_record(&message.channel_login, "ss", protocol_buffer)?;
+    for message in messages.drain(..) {
+        txn.add_record(
+            &message.channel_login,
+            message.server_timestamp.naive_utc(),
+            sonnerie::record(message.sender_login.as_str()).add(message.message_text.as_str()),
+        )?;
     }
 
     txn.commit().map_err(Into::into).map(|_| messages)
@@ -194,7 +185,7 @@ struct TimedUserMessage {
 }
 
 impl TimedUserMessage {
-    fn from_private_nessage(msg: ServerMessage) -> Result<TimedUserMessage, ServerMessage> {
+    fn from_private_message(msg: ServerMessage) -> Result<TimedUserMessage, ServerMessage> {
         match msg {
             ServerMessage::Privmsg(msg) => Ok(TimedUserMessage {
                 server_timestamp: msg.server_timestamp,
@@ -226,12 +217,20 @@ struct WriteFailureDisplay(WriteFailure);
 impl fmt::Display for WriteFailureDisplay {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self.0 {
-            WriteFailure::OrderingViolation(first, second) => {
+            WriteFailure::KeyOrderingViolation { first, second } => {
                 write!(
                     f,
                     "The key `{:?}` does not come lexicographically after `{:?}`, \
                     but they were added in that order",
                     second, first
+                )
+            }
+            WriteFailure::TimeOrderingViolation { first, second, key } => {
+                write!(
+                    f,
+                    "The timestamp `{}` does not come chronologically after `{}`, \
+                    but they were added in that order, in the same key (`{:?}`)",
+                    second, first, key
                 )
             }
             WriteFailure::IncorrectLength(_len) => f.write_str("The size of data was not expected"),

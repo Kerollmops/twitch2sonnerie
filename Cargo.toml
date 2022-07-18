@@ -1,17 +1,16 @@
 [package]
 name = "twitch2sonnerie"
 description = "A tool to stream the chats of Twitch channels into a sonnerie database"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1.0.58"
 chrono = "0.4.19"
 clap = { version = "3.2.5", features = ["derive"] }
-escape_string = "0.1.2"
 futures = "0.3.21"
 gethostname = "0.2.3"
 rustmann = "0.7.3"
-sonnerie = "0.7.1"
+sonnerie = "0.8.0"
 tokio = { version = "1.0", features = ["rt", "time", "sync", "macros", "rt-multi-thread"] }
 twitch-irc = "4.0.0"
